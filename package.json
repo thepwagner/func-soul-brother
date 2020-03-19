@@ -1,0 +1,13 @@
+{
+  "name": "func-soul-brother",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "func start"
+  },
+  "dependencies": {
+    "@octokit/webhooks": "^7.1.0"
+  },
+  "devDependencies": {}
+}
