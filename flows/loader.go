@@ -4,7 +4,8 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"regexp"
+	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/google/go-github/v30/github"
@@ -13,143 +14,233 @@ import (
 	"gopkg.in/yaml.v2"
 )
 
-const actionsPath = ".github/workflows"
-
-type NWO struct {
-	Owner, Name string
-}
+const (
+	// Where in repositories do actions live?
+	actionsPath = ".github/workflows"
+	// Where in repositories does actions metadata live?
+	actionsMetadataFile = "action.yml"
+)
 
 type Loader struct {
-	ghPrivate *github.Client
-	ghPublic  *github.Client
-	client    *http.Client
+	ghPublic *github.Client
+	client   *http.Client
+
+	token          string
+	ghPrivateSetup sync.Once
+	ghPrivate      *github.Client
 
 	jsStepMu sync.Mutex
-	jsSteps  map[string]bool
+	jsSteps  map[string]Action
 }
 
-func NewLoader(ctx context.Context, token string) *Loader {
-	var ghClient *http.Client
-	if token != "" {
-		ghClient = oauth2.NewClient(ctx, oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token}))
+func NewLoader(opts ...Opt) *Loader {
+	l := &Loader{
+		client:  http.DefaultClient,
+		jsSteps: make(map[string]Action),
 	}
+	for _, opt := range opts {
+		opt(l)
+	}
+	l.ghPublic = github.NewClient(l.client)
+	return l
+}
 
-	return &Loader{
-		ghPrivate: github.NewClient(ghClient),
-		ghPublic:  github.NewClient(nil),
-		client:    http.DefaultClient,
-		jsSteps:   make(map[string]bool),
+type Opt func(*Loader)
+
+func WithToken(token string) Opt {
+	return func(l *Loader) {
+		l.token = token
 	}
 }
 
-func (l *Loader) Load(ctx context.Context, nwo NWO) error {
+// LoadedFlow is a .yaml workflow that can be ported to AzureFunctions.
+type LoadedFlow struct {
+	Name     string
+	Triggers []Trigger
+	Steps    []LoadedStep
+}
+
+// Trigger is an event that triggers a workflow, from the YAML `on:`.
+type Trigger struct {
+	Event   string
+	Actions []string
+}
+
+// LoadedStep is a step of a LoadedFlow
+type LoadedStep struct {
+	Name       string
+	SourceCode string
+	Inputs     map[string]string
+}
+
+func (l *Loader) Load(ctx context.Context, owner, name string) ([]LoadedFlow, error) {
 	// List the actions directory to detect workflows:
-	logger := logrus.WithField("repo", fmt.Sprintf("%s/%s", nwo.Owner, nwo.Name))
+	logger := logrus.WithField("repo", fmt.Sprintf("%s/%s", owner, name))
 	logger.WithField("path", actionsPath).Debug("Listing workflows...")
-	_, listing, _, err := l.ghPrivate.Repositories.GetContents(ctx, nwo.Owner, nwo.Name, actionsPath, &github.RepositoryContentGetOptions{})
+	_, listing, _, err := l.ghPrivateClient(ctx).Repositories.GetContents(ctx, owner, name, actionsPath, &github.RepositoryContentGetOptions{})
 	if err != nil {
-		return fmt.Errorf("fetching workflows: %w", err)
+		return nil, fmt.Errorf("fetching workflows: %w", err)
 	}
 	logger.WithField("workflows", len(listing)).Debug("Listed workflows")
 
 	// Attempt to load each workflow:
+	var jobs []LoadedFlow
 	for _, wf := range listing {
-		if err := l.loadWorkflow(ctx, logger, wf); err != nil {
-			return err
+		loaded, err := l.loadWorkflow(ctx, logger, wf)
+		if err != nil {
+			return nil, fmt.Errorf("loading workflow %q: %w", *wf.Path, err)
+		}
+		if loaded != nil {
+			jobs = append(jobs, *loaded)
 		}
 	}
-	return nil
+	return jobs, nil
 }
 
-type Workflow struct {
-	Jobs map[string]*Job `yaml:"jobs"`
+func (l *Loader) ghPrivateClient(ctx context.Context) *github.Client {
+	l.ghPrivateSetup.Do(func() {
+		if l.token == "" {
+			l.ghPrivate = l.ghPublic
+			return
+		}
+		clientCtx := context.WithValue(ctx, oauth2.HTTPClient, l.client)
+		l.ghPrivate = github.NewClient(
+			oauth2.NewClient(clientCtx,
+				oauth2.StaticTokenSource(&oauth2.Token{AccessToken: l.token}),
+			))
+	})
+	return l.ghPrivate
 }
 
-type Job struct {
-	Steps []Step `yaml:"steps"`
-}
-
-type Step struct {
-	Uses string `yaml:"uses"`
-}
-
-type Action struct {
-	Runs Runs `yaml:"runs"`
-}
-
-type Runs struct {
-	Using string `yaml:"using"`
-}
-
-func (l *Loader) loadWorkflow(ctx context.Context, logger logrus.FieldLogger, wf *github.RepositoryContent) error {
+func (l *Loader) loadWorkflow(ctx context.Context, logger logrus.FieldLogger, wf *github.RepositoryContent) (*LoadedFlow, error) {
 	wfName := wf.GetName()
 	logger = logrus.WithField("workflow", wfName)
 	logger.Debug("Fetching workflow...")
 	resp, err := l.client.Get(*wf.DownloadURL)
 	if err != nil {
-		return fmt.Errorf("fetching workflow %q: %w", wfName, err)
+		return nil, fmt.Errorf("fetching workflow %q: %w", wfName, err)
 	}
 	defer resp.Body.Close()
 
 	var flow Workflow
 	if err := yaml.NewDecoder(resp.Body).Decode(&flow); err != nil {
-		return fmt.Errorf("decoding workflow %q: %w", wfName, err)
+		return nil, fmt.Errorf("decoding workflow %q: %w", wfName, err)
 	}
 	logger.Debug("Fetched and parsed workflow")
 
+	var ls []LoadedStep
 	for jobName, job := range flow.Jobs {
 		jobLogger := logger.WithField("job", jobName)
 		for stepIndex, step := range job.Steps {
 			stepLogger := jobLogger.WithField("step", stepIndex)
-			node, err := l.IsNodeStep(ctx, step)
+			action, err := l.fetchActionYAML(ctx, step.Uses)
 			if err != nil {
-				return fmt.Errorf("checking node step %s@%d: %w", jobName, stepIndex, err)
+				return nil, fmt.Errorf("loading action metadata %q: %w", step.Uses, err)
 			}
-			stepLogger.WithField("node", node).Debug("Parsed step")
-			if !node {
-				stepLogger.Info("Step is not node, skipping workflow")
-				return nil
+			if !action.FunctionCompatible() {
+				stepLogger.Info("Step is not compatible, skipping workflow")
+				return nil, nil
 			}
+			stepLogger.Debug("Compatible step detected")
+
+			inputs := map[string]string{}
+			for k, v := range step.With {
+				if strings.Contains(v, "${{") && !strings.Contains(v, "secrets.GITHUB_TOKEN") {
+					stepLogger.Info("Step uses interpolation, skipping workflow")
+					return nil, nil
+				}
+				inputs[k] = v
+			}
+
+			ls = append(ls, LoadedStep{
+				Name:       fmt.Sprintf("%s-%d", jobName, stepIndex),
+				SourceCode: action.SourceCode,
+				Inputs:     step.With,
+			})
 		}
 		jobLogger.Info("Node workflow detected, converting...")
 	}
-	return nil
+
+	f := &LoadedFlow{
+		Name:  filepath.Base(*wf.Path),
+		Steps: ls,
+	}
+
+	switch on := flow.On.(type) {
+	case string:
+		f.Triggers = append(f.Triggers, Trigger{Event: on})
+	case map[interface{}]interface{}:
+		for event, details := range on {
+			trigger := Trigger{Event: event.(string)}
+			if detailsMap, ok := details.(map[interface{}]interface{}); ok {
+				if types, ok := detailsMap["types"]; ok {
+					switch actions := types.(type) {
+					case string:
+						trigger.Actions = []string{actions}
+					case []string:
+						trigger.Actions = actions
+					default:
+						return nil, fmt.Errorf("unexpected `types` type: %T", flow.On)
+					}
+				}
+			}
+
+			f.Triggers = append(f.Triggers, trigger)
+		}
+	default:
+		return nil, fmt.Errorf("unexpected `on` type: %T", flow.On)
+	}
+	return f, nil
 }
 
-var usesRe = regexp.MustCompile("([a-z]*)/([a-z-]*)@([a-z0-9]*)")
-
 func (l *Loader) IsNodeStep(ctx context.Context, step Step) (bool, error) {
+	logrus.WithField("uses", step.Uses).Debug("Detecting node step...")
+	action, err := l.fetchActionYAML(ctx, step.Uses)
+	if err != nil {
+		return false, err
+	}
+	return action.FunctionCompatible(), nil
+}
+
+func (l *Loader) fetchActionYAML(ctx context.Context, uses string) (Action, error) {
+	// Have we checked this step before?
 	l.jsStepMu.Lock()
 	defer l.jsStepMu.Unlock()
-	if js, cached := l.jsSteps[step.Uses]; cached {
-		return js, nil
+	if stored, cached := l.jsSteps[uses]; cached {
+		return stored, nil
 	}
 
-	logrus.WithField("uses", step.Uses).Debug("Detecting node step...")
-	// TODO: non-root paths
-	// TODO: relative path in this repo
-	match := usesRe.FindStringSubmatch(step.Uses)
-	if len(match) == 0 {
-		return false, nil
+	ref, ok := ParseActionReference(uses)
+	if !ok {
+		return Action{}, nil
 	}
-	owner := match[1]
-	name := match[2]
-	ref := match[3]
 
-	contents, _, _, err := l.ghPublic.Repositories.GetContents(ctx, owner, name, "action.yml", &github.RepositoryContentGetOptions{Ref: ref})
+	ghClient := l.ghPublic
+	contentsResp, _, _, err := ghClient.Repositories.GetContents(ctx, ref.RepoOwner, ref.RepoName, actionsMetadataFile, &github.RepositoryContentGetOptions{Ref: ref.Ref})
 	if err != nil {
-		return false, fmt.Errorf("fetching action.yml %q: %w", step.Uses, err)
+		return Action{}, fmt.Errorf("fetching action metadata: %w", err)
 	}
-	actionsYAML, err := contents.GetContent()
+	contents, err := contentsResp.GetContent()
 	if err != nil {
-		return false, fmt.Errorf("decoding action.yml contents %q: %w", step.Uses, err)
+		return Action{}, fmt.Errorf("decoding action metadata contents: %w", err)
 	}
 	var action Action
-	if err := yaml.Unmarshal([]byte(actionsYAML), &action); err != nil {
-		return false, fmt.Errorf("decoding action.yml %q: %w", step.Uses, err)
+	if err := yaml.Unmarshal([]byte(contents), &action); err != nil {
+		return Action{}, fmt.Errorf("decoding action metadata: %w", err)
 	}
 
-	nodeAction := action.Runs.Using == "node12"
-	l.jsSteps[step.Uses] = nodeAction
-	return nodeAction, nil
+	if action.FunctionCompatible() {
+		contentsResp, _, _, err := ghClient.Repositories.GetContents(ctx, ref.RepoOwner, ref.RepoName, action.Runs.Main, &github.RepositoryContentGetOptions{Ref: ref.Ref})
+		if err != nil {
+			return Action{}, fmt.Errorf("fetching action metadata: %w", err)
+		}
+		contents, err := contentsResp.GetContent()
+		if err != nil {
+			return Action{}, fmt.Errorf("decoding action metadata contents: %w", err)
+		}
+		action.SourceCode = contents
+	}
+
+	l.jsSteps[uses] = action
+	return action, nil
 }

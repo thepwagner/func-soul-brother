@@ -11,30 +11,37 @@ import (
 
 func main() {
 	logrus.SetLevel(logrus.DebugLevel)
-	ctx := context.Background()
 
 	// Target repository to convert:
-	nwo := flows.NWO{
-		Owner: "thepwagner",
-		Name:  "echo-chamber",
-	}
+	const (
+		owner           = "thepwagner"
+		name            = "echo-chamber"
+		azResourceGroup = "funcsoulbrother"
+	)
 	azSubscriptionID := os.Getenv("AZ_SUBSCRIPTION")
-	azResourceGroup := "funcsoulbrother"
 	ghToken := os.Getenv("GITHUB_TOKEN")
 
+	loader := flows.NewLoader(flows.WithToken(ghToken))
+
 	// Query target repo for workflows
-	loader := flows.NewLoader(ctx, ghToken)
-	err := loader.Load(ctx, nwo)
+	ctx := context.Background()
+	loaded, err := loader.Load(ctx, owner, name)
 	if err != nil {
-		panic(err)
+		logrus.WithError(err).Fatal("Loading repo workflows")
 	}
+	if len(loaded) == 0 {
+		logrus.Fatal("No convertible flows found")
+	}
+	logrus.WithField("flows", len(loaded)).Info("Loaded flows")
 
 	uploader, err := az.NewFunctionUploader(azSubscriptionID, azResourceGroup)
 	if err != nil {
-		panic(err)
+		logrus.WithError(err).Fatal("Preparing function uploader")
 	}
-	wfName := "fsb-cloud.yaml"
-	if err := uploader.Upload(ctx, wfName); err != nil {
-		panic(err)
+	for _, flow := range loaded {
+		// TODO: receive a endpoint, configure the repo webhook according to flow.Triggers
+		if err := uploader.Upload(ctx, flow); err != nil {
+			logrus.WithError(err).Error("Uploading workflow")
+		}
 	}
 }

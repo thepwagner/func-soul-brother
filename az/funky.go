@@ -17,6 +17,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/services/storage/mgmt/2019-06-01/storage"
 	"github.com/Azure/azure-storage-blob-go/azblob"
 	"github.com/Azure/go-autorest/autorest/azure/auth"
+	"github.com/thepwagner/func-soul-brother/flows"
 
 	"github.com/sirupsen/logrus"
 )
@@ -57,15 +58,16 @@ func NewFunctionUploader(subscriptionID, resourceGroupName string) (*FunctionUpl
 	}, nil
 }
 
-func (f *FunctionUploader) Upload(ctx context.Context, workflowName string) error {
-	deploymentName := strings.ReplaceAll(workflowName, "-", "")
+func (f *FunctionUploader) Upload(ctx context.Context, flow *flows.LoadedFlow) error {
+	deploymentName := strings.ReplaceAll(flow.Name, "-", "")
 	deploymentName = strings.ReplaceAll(deploymentName, ".", "")
+	deploymentName = fmt.Sprintf("dsp%s", deploymentName)
 
 	blobURL, err := f.uploadCode(ctx, deploymentName)
 	if err != nil {
 		return fmt.Errorf("uploading code: %w", err)
 	}
-	if err := f.deployFunction(ctx, deploymentName, workflowName, blobURL); err != nil {
+	if err := f.deployFunction(ctx, deploymentName, flow.Name, blobURL); err != nil {
 		return fmt.Errorf("deploying function: %w", err)
 	}
 	return nil
