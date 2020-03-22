@@ -20,6 +20,7 @@ func main() {
 	)
 	azSubscriptionID := os.Getenv("AZ_SUBSCRIPTION")
 	ghToken := os.Getenv("GITHUB_TOKEN")
+	webhookSecret := os.Getenv("WEBHOOK_SECRET")
 
 	loader := flows.NewLoader(flows.WithToken(ghToken))
 
@@ -34,7 +35,7 @@ func main() {
 	}
 	logrus.WithField("flows", len(loaded)).Info("Loaded flows")
 
-	uploader, err := az.NewFunctionUploader(azSubscriptionID, azResourceGroup)
+	uploader, err := az.NewFunctionUploader(azSubscriptionID, azResourceGroup, webhookSecret, ghToken)
 	if err != nil {
 		logrus.WithError(err).Fatal("Preparing function uploader")
 	}

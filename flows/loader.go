@@ -2,6 +2,8 @@ package flows
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"path/filepath"
@@ -243,4 +245,9 @@ func (l *Loader) fetchActionYAML(ctx context.Context, uses string) (Action, erro
 
 	l.jsSteps[uses] = action
 	return action, nil
+}
+
+func (s LoadedStep) Filename() string {
+	hash := sha256.Sum256([]byte(s.SourceCode))
+	return hex.EncodeToString(hash[:])
 }

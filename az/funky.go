@@ -4,7 +4,6 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/url"
@@ -25,10 +24,12 @@ import (
 type FunctionUploader struct {
 	deploys           resources.DeploymentsClient
 	resourceGroupName string
+	webhookSecret     string
+	githubToken       string
 	storage           storage.AccountsClient
 }
 
-func NewFunctionUploader(subscriptionID, resourceGroupName string) (*FunctionUploader, error) {
+func NewFunctionUploader(subscriptionID, resourceGroupName, webhookSecret, githubToken string) (*FunctionUploader, error) {
 	logrus.WithFields(logrus.Fields{
 		"subscription_id": subscriptionID,
 		"rg_name":         resourceGroupName,
@@ -55,15 +56,22 @@ func NewFunctionUploader(subscriptionID, resourceGroupName string) (*FunctionUpl
 		deploys:           deploys,
 		resourceGroupName: resourceGroupName,
 		storage:           storageAccounts,
+		webhookSecret:     webhookSecret,
+		githubToken:       githubToken,
 	}, nil
 }
 
-func (f *FunctionUploader) Upload(ctx context.Context, flow *flows.LoadedFlow) error {
+func (f *FunctionUploader) Upload(ctx context.Context, flow flows.LoadedFlow) error {
 	deploymentName := strings.ReplaceAll(flow.Name, "-", "")
 	deploymentName = strings.ReplaceAll(deploymentName, ".", "")
-	deploymentName = fmt.Sprintf("dsp%s", deploymentName)
+	deploymentName = fmt.Sprintf("fsb%s", deploymentName)
 
-	blobURL, err := f.uploadCode(ctx, deploymentName)
+	// FIXME: the storage account may not exist on first deploy; break the template up to separate storage from the function
+	codeZip, err := packageFunctionZip(f.webhookSecret, f.githubToken, flow)
+	if err != nil {
+		return fmt.Errorf("generating code: %w", err)
+	}
+	blobURL, err := f.uploadCode(ctx, deploymentName, codeZip)
 	if err != nil {
 		return fmt.Errorf("uploading code: %w", err)
 	}
@@ -77,14 +85,9 @@ func (f *FunctionUploader) deployFunction(ctx context.Context, deploymentName, w
 	deployLogger := logrus.WithField("deployment", deploymentName)
 	deployLogger.Debug("Updating function deployment...")
 
-	// FIXME: sync.Once
-	tmpl := make(map[string]interface{})
-	if err := json.Unmarshal([]byte(template), &tmpl); err != nil {
-		return fmt.Errorf("parsing template: %w", err)
-	}
 	update, err := f.deploys.CreateOrUpdate(ctx, f.resourceGroupName, deploymentName, resources.Deployment{
 		Properties: &resources.DeploymentProperties{
-			Template: &tmpl,
+			Template: &azureResourcesTemplate,
 			Parameters: map[string]interface{}{
 				"appName": map[string]interface{}{
 					"value": workflowName,
@@ -113,11 +116,7 @@ func (f *FunctionUploader) deployFunction(ctx context.Context, deploymentName, w
 	return nil
 }
 
-func (f *FunctionUploader) uploadCode(ctx context.Context, storageAccountName string) (string, error) {
-	codeZip, err := packageFunctionZip()
-	if err != nil {
-		return "", err
-	}
+func (f *FunctionUploader) uploadCode(ctx context.Context, storageAccountName string, codeZip []byte) (string, error) {
 
 	keys, err := f.storage.ListKeys(ctx, f.resourceGroupName, storageAccountName, "")
 	if err != nil {
@@ -140,7 +139,7 @@ func (f *FunctionUploader) uploadCode(ctx context.Context, storageAccountName st
 
 	blobName := time.Now().Format(time.RFC3339)
 	blobURL := containerURL.NewBlockBlobURL(blobName)
-	logrus.WithField("blob_url", blobURL.String()).Debug("uploading zip package")
+	logrus.WithField("blob_url", blobURL.String()).Debug("Uploading zip package")
 	_, err = blobURL.Upload(ctx, bytes.NewReader(codeZip),
 		azblob.BlobHTTPHeaders{
 			ContentType: "application/zip",
@@ -165,17 +164,9 @@ func (f *FunctionUploader) uploadCode(ctx context.Context, storageAccountName st
 	return signedURL, nil
 }
 
-func packageFunctionZip() ([]byte, error) {
+func packageFunctionZip(secret, token string, flow flows.LoadedFlow) ([]byte, error) {
 	var buf bytes.Buffer
 	zw := zip.NewWriter(&buf)
-
-	dotFuncIgnore, err := zw.Create(".funcignore")
-	if err != nil {
-		return nil, err
-	}
-	if _, err := dotFuncIgnore.Write(funcIgnore); err != nil {
-		return nil, err
-	}
 
 	functionJSON, err := zw.Create("FuncSoulBrother/function.json")
 	if err != nil {
@@ -189,9 +180,7 @@ func packageFunctionZip() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	index := []byte(fmt.Sprintf(entryPoint, os.Getenv("GITHUB_TOKEN")))
-	if _, err := indexJS.Write(index); err != nil {
+	if _, err := indexJS.Write([]byte(GenerateEntrypoint(secret, token, flow))); err != nil {
 		return nil, err
 	}
 
@@ -218,16 +207,25 @@ func packageFunctionZip() ([]byte, error) {
 		return nil, modulesWalkErr
 	}
 
-	// FIXME: from scanned repo, not hardcode:
-	if err := addFile(zw, "echo-timer.js"); err != nil {
-		return nil, err
+	stepFiles := map[string]struct{}{}
+	for _, step := range flow.Steps {
+		fn := step.Filename()
+
+		if _, ok := stepFiles[fn]; ok {
+			continue
+		}
+		stepFiles[fn] = struct{}{}
+
+		stepFile, err := zw.Create(fmt.Sprintf("%s.js", fn))
+		if err != nil {
+			return nil, err
+		}
+		if _, err := fmt.Fprint(stepFile, step.SourceCode); err != nil {
+			return nil, err
+		}
 	}
 
-	proxiesJSON, err := zw.Create("proxies.json")
-	if err != nil {
-		return nil, err
-	}
-	if _, err := proxiesJSON.Write(proxiesConfig); err != nil {
+	if err := addFile(zw, "proxies.json"); err != nil {
 		return nil, err
 	}
 
